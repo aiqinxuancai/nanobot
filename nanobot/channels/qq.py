@@ -2,6 +2,8 @@
 
 import asyncio
 import base64
+import inspect
+import json
 import mimetypes
 from collections import deque
 from pathlib import Path
@@ -19,6 +21,7 @@ from nanobot.config.schema import QQConfig
 
 try:
     import botpy
+    from botpy import gateway as botpy_gateway
     from botpy import Client
     from botpy.http import Route
 
@@ -26,6 +29,7 @@ try:
 except ImportError:
     QQ_AVAILABLE = False
     botpy = None
+    botpy_gateway = None
     C2CMessage = None
     GroupMessage = None
     Media = None
@@ -69,6 +73,86 @@ def _guess_attachment_label(content_type: str | None) -> str:
     if content_type and content_type.startswith("video/"):
         return "video"
     return "file"
+
+
+def _patch_botpy_heartbeat() -> None:
+    """Patch botpy to honor gateway-provided heartbeat intervals."""
+    if not botpy_gateway:
+        return
+
+    websocket_cls = botpy_gateway.BotWebSocket
+    if getattr(websocket_cls, "_nanobot_heartbeat_patch", False):
+        return
+
+    async def _start_heartbeat(self) -> None:
+        task = getattr(self, "_nanobot_heartbeat_task", None)
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        interval = float(getattr(self, "_nanobot_heartbeat_interval", 30.0) or 30.0)
+        self._nanobot_heartbeat_task = self._connection.loop.create_task(self._send_heart(interval=interval))
+
+    async def _patched_is_system_event(self, message_event, ws):
+        event_op = message_event["op"]
+        if event_op == self.WS_HELLO:
+            heartbeat_ms = (message_event.get("d") or {}).get("heartbeat_interval")
+            if heartbeat_ms:
+                self._nanobot_heartbeat_interval = max(float(heartbeat_ms) / 1000.0, 1.0)
+                botpy_gateway._log.info(
+                    "[botpy] 使用服务端心跳间隔: %.3fs", self._nanobot_heartbeat_interval
+                )
+            await self.on_connected(ws)
+            return True
+        if event_op == self.WS_HEARTBEAT_ACK:
+            return True
+        if event_op == self.WS_RECONNECT:
+            self._can_reconnect = True
+            return True
+        if event_op == self.WS_INVALID_SESSION:
+            self._can_reconnect = False
+            return True
+        return False
+
+    async def _patched_on_message(self, ws, message):
+        botpy_gateway._log.debug("[botpy] 接收消息: %s" % message)
+        msg = json.loads(message)
+        if await self._is_system_event(msg, ws):
+            return
+
+        event = msg.get("t")
+        opcode = msg.get("op")
+        event_seq = msg.get("s") or 0
+        if event_seq > 0:
+            self._session["last_seq"] = event_seq
+
+        if event == "READY":
+            await self._nanobot_start_heartbeat()
+            ready = await self._ready_handler(msg)
+            botpy_gateway._log.info(f"[botpy] 机器人「{ready['user']['username']}」启动成功！")
+
+        if event == "RESUMED":
+            await self._nanobot_start_heartbeat()
+            botpy_gateway._log.info("[botpy] 机器人重连成功! ")
+
+        if event and opcode == self.WS_DISPATCH_EVENT:
+            event = msg["t"].lower()
+            try:
+                func = self._parser[event]
+            except KeyError:
+                botpy_gateway._log.error("_parser unknown event %s.", event)
+            else:
+                result = func(msg)
+                if inspect.isawaitable(result):
+                    await result
+
+    websocket_cls._nanobot_start_heartbeat = _start_heartbeat
+    websocket_cls._is_system_event = _patched_is_system_event
+    websocket_cls.on_message = _patched_on_message
+    websocket_cls._nanobot_heartbeat_patch = True
 
 
 def _get_file_type(file_path: str) -> int:
@@ -140,6 +224,7 @@ class QQChannel(BaseChannel):
             logger.error("QQ app_id and secret not configured")
             return
 
+        _patch_botpy_heartbeat()
         self._running = True
         BotClass = _make_bot_class(self)
         self._client = BotClass()
