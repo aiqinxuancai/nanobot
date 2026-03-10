@@ -41,6 +41,11 @@ QQ_FILE_TYPE_VIDEO = 3
 QQ_FILE_TYPE_FILE = 4
 
 
+def _encode_file_base64(path: Path) -> str:
+    """Read a local file and return its base64-encoded contents."""
+    return base64.b64encode(path.read_bytes()).decode("ascii")
+
+
 def _get_file_type(file_path: str) -> int:
     """根据文件路径判断QQ文件类型."""
     ext = Path(file_path).suffix.lower()
@@ -144,7 +149,7 @@ class QQChannel(BaseChannel):
             return
 
         msg_id = msg.metadata.get("message_id")
-        msg_type = self._chat_type_cache.get(msg.chat_id, "c2c")
+        msg_type = str(msg.metadata.get("chat_type") or self._chat_type_cache.get(msg.chat_id, "c2c"))
 
         # 发送富媒体文件
         is_group = msg_type == "group"
@@ -189,7 +194,7 @@ class QQChannel(BaseChannel):
             logger.warning("QQ media file not found: {}", file_path)
             return False
 
-        base64_encoded_data = base64.b64encode(path.read_bytes()).decode()
+        base64_encoded_data = await asyncio.to_thread(_encode_file_base64, path)
         file_type = _get_file_type(file_path)
         chat_type = "group" if is_group else "c2c"
 
@@ -262,7 +267,10 @@ class QQChannel(BaseChannel):
                 sender_id=user_id,
                 chat_id=chat_id,
                 content=content,
-                metadata={"message_id": data.id},
+                metadata={
+                    "message_id": data.id,
+                    "chat_type": "group" if is_group else "c2c",
+                },
             )
         except Exception:
             logger.exception("Error handling QQ message")
