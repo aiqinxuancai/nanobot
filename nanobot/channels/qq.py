@@ -5,13 +5,16 @@ import base64
 import mimetypes
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+import httpx
 
 from loguru import logger
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import QQConfig
 
 try:
@@ -44,6 +47,28 @@ QQ_FILE_TYPE_FILE = 4
 def _encode_file_base64(path: Path) -> str:
     """Read a local file and return its base64-encoded contents."""
     return base64.b64encode(path.read_bytes()).decode("ascii")
+
+
+def _resolve_attachment_url(raw_url: str) -> str:
+    """Normalize QQ attachment URLs into absolute HTTPS URLs."""
+    if raw_url.startswith(("http://", "https://")):
+        return raw_url
+    if raw_url.startswith("//"):
+        return f"https:{raw_url}"
+    if raw_url.startswith("/"):
+        return f"https://api.sgroup.qq.com{raw_url}"
+    return f"https://{raw_url.lstrip('/')}"
+
+
+def _guess_attachment_label(content_type: str | None) -> str:
+    """Return a human-friendly label for an incoming attachment."""
+    if content_type and content_type.startswith("image/"):
+        return "image"
+    if content_type and content_type.startswith("audio/"):
+        return "audio"
+    if content_type and content_type.startswith("video/"):
+        return "video"
+    return "file"
 
 
 def _get_file_type(file_path: str) -> int:
@@ -239,6 +264,37 @@ class QQChannel(BaseChannel):
             logger.error("Error sending QQ {} media {}: {}", chat_type, path.name, e)
             return False
 
+    async def _download_attachment(
+        self, message_id: str, index: int, attachment: Any
+    ) -> tuple[str | None, str]:
+        """Download an incoming QQ attachment to the local media directory."""
+        raw_url = str(getattr(attachment, "url", "") or "")
+        if not raw_url:
+            return None, "[file: missing url]"
+
+        url = _resolve_attachment_url(raw_url)
+        content_type = str(getattr(attachment, "content_type", "") or "")
+        label = _guess_attachment_label(content_type)
+
+        original_name = Path(str(getattr(attachment, "filename", "") or "")).name
+        if not original_name:
+            ext = mimetypes.guess_extension(content_type) or ""
+            original_name = f"{label}_{index}{ext}"
+
+        target_name = f"{message_id[:16]}_{index}_{original_name}"
+        file_path = get_media_dir("qq") / target_name
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+            await asyncio.to_thread(file_path.write_bytes, response.content)
+            logger.debug("Downloaded QQ attachment to {}", file_path)
+            return str(file_path), f"[{label}: {original_name}]"
+        except Exception as e:
+            logger.warning("Failed to download QQ attachment {} from {}: {}", original_name, url, e)
+            return None, f"[{label}: download failed]"
+
     async def _on_message(self, data: "C2CMessage | GroupMessage", is_group: bool = False) -> None:
         """Handle incoming message from QQ."""
         try:
@@ -247,9 +303,12 @@ class QQChannel(BaseChannel):
                 return
             self._processed_ids.append(data.id)
 
+            content_parts: list[str] = []
+            media_paths: list[str] = []
+
             content = (data.content or "").strip()
-            if not content:
-                return
+            if content:
+                content_parts.append(content)
 
             if is_group:
                 chat_id = data.group_openid
@@ -263,10 +322,22 @@ class QQChannel(BaseChannel):
                 user_id = chat_id
                 self._chat_type_cache[chat_id] = "c2c"
 
+            attachments = getattr(data, "attachments", None) or []
+            for index, attachment in enumerate(attachments):
+                file_path, content_text = await self._download_attachment(data.id, index, attachment)
+                if file_path:
+                    media_paths.append(file_path)
+                if content_text:
+                    content_parts.append(content_text)
+
+            if not content_parts and not media_paths:
+                return
+
             await self._handle_message(
                 sender_id=user_id,
                 chat_id=chat_id,
-                content=content,
+                content="\n".join(content_parts) if content_parts else "[empty message]",
+                media=media_paths,
                 metadata={
                     "message_id": data.id,
                     "chat_type": "group" if is_group else "c2c",

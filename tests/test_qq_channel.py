@@ -26,6 +26,36 @@ class _FakeClient:
 
 
 @pytest.mark.asyncio
+async def test_on_group_message_with_attachment_routes_media(monkeypatch: pytest.MonkeyPatch) -> None:
+    channel = QQChannel(QQConfig(app_id="app", secret="secret", allow_from=["user1"]), MessageBus())
+
+    async def _fake_download(message_id: str, index: int, attachment) -> tuple[str | None, str]:
+        assert message_id == "msg-media"
+        assert index == 0
+        assert attachment.filename == "photo.png"
+        return ("C:/tmp/photo.png", "[image: photo.png]")
+
+    monkeypatch.setattr(channel, "_download_attachment", _fake_download)
+
+    data = SimpleNamespace(
+        id="msg-media",
+        content="",
+        attachments=[SimpleNamespace(filename="photo.png", content_type="image/png", url="https://example.com/photo.png")],
+        group_openid="group123",
+        author=SimpleNamespace(member_openid="user1"),
+    )
+
+    await channel._on_message(data, is_group=True)
+
+    msg = await channel.bus.consume_inbound()
+    assert msg.sender_id == "user1"
+    assert msg.chat_id == "group123"
+    assert msg.content == "[image: photo.png]"
+    assert msg.media == ["C:/tmp/photo.png"]
+    assert msg.metadata["chat_type"] == "group"
+
+
+@pytest.mark.asyncio
 async def test_on_group_message_routes_to_group_chat_id() -> None:
     channel = QQChannel(QQConfig(app_id="app", secret="secret", allow_from=["user1"]), MessageBus())
 
